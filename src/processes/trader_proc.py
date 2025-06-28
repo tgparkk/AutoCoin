@@ -16,12 +16,13 @@ def trader_process(
     order_q: Queue,
     resp_q: Queue,
     shutdown_ev: Event,
+    strategy_name: str = "scalping",
 ):
     """Trader.run 을 별도 프로세스로 래핑"""
 
-    logger.info("Trader 프로세스 시작")
+    logger.info("Trader 프로세스 시작: 전략=%s", strategy_name)
     try:
-        Trader.run(tick_q, command_q, notify_q, db_q, order_q, resp_q, shutdown_ev)
+        Trader.run(tick_q, command_q, notify_q, db_q, order_q, resp_q, shutdown_ev, strategy_name)
     except Exception as exc:  # pragma: no cover
         logger.exception("Trader 프로세스 예외: %s", exc)
     finally:

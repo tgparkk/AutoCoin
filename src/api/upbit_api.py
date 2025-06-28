@@ -6,6 +6,7 @@ from config.api_config import UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY
 from typing import Any, List, Dict, Optional
 
 from src.utils.errors import UpbitAPIError
+from src.utils.rate_limiter import rate_limit
 
 
 class UpbitAPI:
@@ -22,12 +23,14 @@ class UpbitAPI:
             raise UpbitAPIError("Upbit 인증 실패: 키를 확인하세요") from exc
 
     # ----------------------------- 계좌 ----------------------------- #
+    @rate_limit(endpoint='account')
     def list_accounts(self) -> List[Dict[str, Any]]:
         try:
             return self._client.get_balances()
         except Exception as exc:
             raise UpbitAPIError(str(exc)) from exc
 
+    @rate_limit(endpoint='account')
     def get_order_chance(self, market: str) -> Dict[str, Any]:
         try:
             return self._client.get_chance(market)
@@ -35,12 +38,14 @@ class UpbitAPI:
             raise UpbitAPIError(str(exc)) from exc
 
     # ----------------------------- 주문 ----------------------------- #
+    @rate_limit(endpoint='order')
     def get_order(self, uuid: Optional[str] = None, identifier: Optional[str] = None):
         try:
             return self._client.get_order(uuid=uuid, identifier=identifier)
         except Exception as exc:
             raise UpbitAPIError(str(exc)) from exc
 
+    @rate_limit(endpoint='order')
     def list_orders(
         self,
         state: str = "wait",
@@ -57,6 +62,7 @@ class UpbitAPI:
         except Exception as exc:
             raise UpbitAPIError(str(exc)) from exc
 
+    @rate_limit(endpoint='order')
     def place_order(
         self,
         market: str,
@@ -91,6 +97,7 @@ class UpbitAPI:
         except Exception as exc:
             raise UpbitAPIError(str(exc)) from exc
 
+    @rate_limit(endpoint='cancel')
     def cancel_order(self, uuid: Optional[str] = None, identifier: Optional[str] = None):
         try:
             return self._client.cancel_order(uuid=uuid, identifier=identifier)
@@ -107,6 +114,7 @@ class UpbitAPI:
         return results
 
     # ----------------------------- 시세 ----------------------------- #
+    @rate_limit(endpoint='market')
     def get_markets(self, is_details: bool = False):
         try:
             # pyupbit 은 show_details 플래그 사용
@@ -114,6 +122,7 @@ class UpbitAPI:
         except Exception as exc:
             raise UpbitAPIError(str(exc)) from exc
 
+    @rate_limit(endpoint='market')
     def get_candles(
         self,
         unit: str,
@@ -147,12 +156,14 @@ class UpbitAPI:
         except Exception as exc:
             raise UpbitAPIError(str(exc)) from exc
 
+    @rate_limit(endpoint='market')
     def get_trades(self, market: str, count: int = 30):
         try:
             return pyupbit.get_ticks(market, count=count)
         except Exception as exc:
             raise UpbitAPIError(str(exc)) from exc
 
+    @rate_limit(endpoint='market')
     def get_ticker(self, markets: List[str]):
         try:
             return pyupbit.get_current_price(markets)
@@ -160,6 +171,7 @@ class UpbitAPI:
             raise UpbitAPIError(str(exc)) from exc
 
     # ----------------- 기존 메서드 호환 ----------------- #
+    @rate_limit(endpoint='account')
     def get_balance(self, ticker: str = "KRW") -> float:  # noqa: D401 – simple wrapper
         return self._client.get_balance(ticker)
 
