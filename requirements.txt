@@ -7,4 +7,5 @@ python-dotenv>=1.0.0
 cryptography>=41.0.0
 schedule>=1.2.0
 python-telegram-bot>=20.0
-pyupbit>=0.5.1 
+pyupbit>=0.5.1
+tqdm>=4.66.0 

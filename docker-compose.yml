@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  autocoin:
+    build: .
+    container_name: autocoin
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data  # 데이터 및 DB 지속성
+    # CPU 및 메모리 제한 예시 (필요 시)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "0.95"
+    #       memory: 1g
+    command: >
+      sh -c "python main.py --strategy ${STRATEGY:-scalping}" 

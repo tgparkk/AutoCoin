@@ -96,4 +96,21 @@ from src.strategy.strategy_manager import StrategyManager
 
 strategy_manager = StrategyManager("advanced_scalping")
 strategy_manager.prepare_all_strategies()
-``` 
+```
+
+## Docker로 실행하기
+```bash
+# 환경 변수 파일 생성 및 편집
+cp env.example .env  # API 키·토큰 입력
+
+# 컨테이너 빌드 & 실행
+docker compose up -d --build
+
+# 로그 확인
+docker compose logs -f
+```
+
+Docker 환경에서는 `/app/data` 디렉터리가 호스트의 `./data`에 마운트되어
+데이터베이스·캔들 파일이 컨테이너 재시작 후에도 유지됩니다. 전략 변경은
+`.env` 의 `STRATEGY` 변수 혹은 `docker compose run -e STRATEGY=ma_cross` 방식으로
+쉽게 적용할 수 있습니다. 

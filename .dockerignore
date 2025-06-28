@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+*.log
+.venv/
+.git/
+# 데이터 백테스트는 이미지에 포함하지 않음
+/data/backtest/ 
