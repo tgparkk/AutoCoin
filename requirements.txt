@@ -9,4 +9,4 @@ schedule>=1.2.0
 python-telegram-bot[rate-limiter]>=20.0
 pyupbit>=0.5.1
 tqdm>=4.66.0
-aiolimiter>=1.0 
+aiolimiter>=1.1.0 
