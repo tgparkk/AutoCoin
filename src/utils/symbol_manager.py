@@ -6,26 +6,49 @@ from __future__ import annotations
 향후 기준(변동성, 시총 등)을 추가하고 싶다면 `select_symbols` 메서드를 확장하면 된다.
 """
 
-from typing import List
+from typing import List, Optional, Dict, Set
 import time
 from threading import Lock
 
 import requests  # Upbit REST API 호출용
 
 from src.utils.logger import get_logger
+from config.settings import TOP_N_SYMBOLS, SAFETY_FILTERS
 
 logger = get_logger(__name__)
 
 
 class SymbolManager:  # pylint: disable=too-few-public-methods
-    """종목 리스트를 주기적으로 재평가·관리한다."""
+    """종목 리스트를 주기적으로 재평가·관리한다.
 
-    def __init__(self, initial_symbols: List[str], refresh_interval: int = 600, max_symbols: int = 3):
+    Args:
+        initial_symbols (list[str]): 최초 심볼 리스트 (fallback)
+        refresh_interval (int): 재평가 주기(초)
+        max_symbols (int): 유지할 최대 종목 수
+        buyable_symbols (Optional[Dict[str, bool]]): IndicatorWorker 가 업데이트하는 공유 dict.
+            제공 시 안전 필터 통과 & buyable 에 포함된 종목만 후보군으로 사용한다.
+    """
+
+    def __init__(
+        self,
+        initial_symbols: List[str],
+        refresh_interval: int = 600,
+        max_symbols: int = TOP_N_SYMBOLS,
+        buyable_symbols: Optional[Dict[str, bool]] = None,
+    ):
+
         self._symbols: List[str] = initial_symbols.copy()
         self._last_refresh = 0.0
         self.refresh_interval = refresh_interval  # 초
         self.max_symbols = max_symbols
         self._lock = Lock()
+
+        # buyable dict (Manager dict) – key 만 사용
+        self._buyable_symbols = buyable_symbols
+
+        # 안전 티커 캐시
+        self._safe_tickers: Set[str] | None = None
+        self._safe_cache_ts: float = 0.0
 
     # ----------------------- Public API ----------------------- #
     @property
@@ -62,78 +85,81 @@ class SymbolManager:  # pylint: disable=too-few-public-methods
         return False
 
     # ----------------------- Internal ----------------------- #
-    def _select_symbols(self) -> List[str]:
-        """Upbit WebSocket 스냅샷을 이용해 24h 거래대금 상위 심볼을 산출한다."""
-        import json
-        from websocket import create_connection  # websocket-client
+    def _fetch_safe_tickers(self) -> Set[str]:
+        """/market/all 을 호출하여 안전한 KRW 마켓 리스트 반환 (1h 캐시)"""
+        now = time.time()
+        if self._safe_tickers is not None and (now - self._safe_cache_ts) < 3600:
+            return self._safe_tickers
 
-        # Upbit 종목 코드 조회는 공식 REST 엔드포인트만 지원된다.
-        url = "https://api.upbit.com/v1/market/all"
+        url_all = "https://api.upbit.com/v1/market/all"
         try:
-            resp = requests.get(url, timeout=5)
+            resp = requests.get(url_all, params={"is_details": "true"}, timeout=5)
             resp.raise_for_status()
-            markets = resp.json()
-            tickers = [m["market"] for m in markets if m["market"].startswith("KRW-")]
+            markets: list[dict] = resp.json()
         except Exception as exc:
-            raise RuntimeError(f"Failed to fetch KRW tickers: {exc}") from exc
+            raise RuntimeError(f"Failed to fetch market list: {exc}") from exc
 
-        if not tickers:
-            raise RuntimeError("No KRW tickers returned from Upbit REST API")
+        safe: Set[str] = set()
+        for m in markets:
+            if not m["market"].startswith("KRW-"):
+                continue
 
+            event = m.get("market_event", {})
+            warning = bool(event.get("warning"))
+            caution = event.get("caution", {}) or {}
+            small_acc = bool(caution.get("CONCENTRATION_OF_SMALL_ACCOUNTS"))
+
+            if SAFETY_FILTERS.get("exclude_warning") and warning:
+                continue
+            if SAFETY_FILTERS.get("exclude_small_acc") and small_acc:
+                continue
+
+            safe.add(m["market"])
+
+        if not safe:
+            raise RuntimeError("No safe KRW tickers after filtering")
+
+        self._safe_tickers = safe
+        self._safe_cache_ts = now
+        return safe
+
+    def _select_symbols(self) -> List[str]:
+        """안전 필터 + IndicatorWorker 의 buyable 세트 + 거래대금 랭킹"""
+
+        safe_tickers = self._fetch_safe_tickers()
+
+        # buyable 심볼과 교집합 적용
+        if self._buyable_symbols is not None and len(self._buyable_symbols) > 0:
+            candidates = list(set(self._buyable_symbols.keys()) & safe_tickers)
+        else:
+            candidates = list(safe_tickers)
+
+        if not candidates:
+            logger.warning("No candidates after applying buyable filter; fallback to safe tickers top-volume ranking")
+            candidates = list(safe_tickers)
+
+        # 2) 대량 /ticker REST 호출로 24h 거래대금 취득 ----------------------
         results: list[dict] = []
-        chunk_size = 100  # 웹소켓 codes 필드도 100개 이내가 안전
-
-        for i in range(0, len(tickers), chunk_size):
-            codes = tickers[i : i + chunk_size]
+        chunk_size = 100
+        for i in range(0, len(candidates), chunk_size):
+            markets_chunk = candidates[i : i + chunk_size]
+            url_ticker = "https://api.upbit.com/v1/ticker"
             try:
-                ws = create_connection("wss://api.upbit.com/websocket/v1", timeout=5)
-                req_msg = [
-                    {"ticket": "symbol_manager"},
-                    {"type": "ticker", "codes": codes, "is_only_snapshot": True},
-                    {"format": "DEFAULT"},
-                ]
-                ws.send(json.dumps(req_msg))
-
-                for _ in codes:
-                    raw = ws.recv()
-                    # 응답은 bytes 형식
-                    if isinstance(raw, bytes):
-                        data = json.loads(raw.decode("utf-8"))
-                    else:
-                        data = json.loads(raw)
-                    results.append(data)
+                resp = requests.get(url_ticker, params={"markets": ",".join(markets_chunk)}, timeout=5)
+                resp.raise_for_status()
+                results.extend(resp.json())
             except Exception as exc:
-                logger.warning("WebSocket snapshot error (%s-%s): %s", i, i+chunk_size, exc)
-            finally:
-                try:
-                    ws.close()
-                except Exception:  # pragma: no cover
-                    pass
+                logger.warning("Ticker batch request failed (%s-%s): %s", i, i+chunk_size, exc)
 
         if not results:
-            raise RuntimeError("Failed to retrieve ticker snapshot via WebSocket")
+            raise RuntimeError("Failed to retrieve ticker information via REST")
 
-        # 정렬 후 상위 심볼 추출
+        # 3) 거래대금 정렬 및 상위 max_symbols 반환 ---------------------------
         results.sort(key=lambda d: d.get("acc_trade_price_24h", 0.0), reverse=True)
-        
-        # WebSocket 응답 구조 디버깅 및 안전한 파싱
-        top = []
-        for i, d in enumerate(results[: self.max_symbols]):
-            if "cd" in d:
-                top.append(d["cd"])
-            elif "code" in d:
-                top.append(d["code"])
-            else:
-                logger.warning("Unexpected ticker response format at index %d: %s", i, list(d.keys())[:5])
-                # 기본값으로 market 필드 시도
-                if "market" in d:
-                    top.append(d["market"])
-        
-        if not top:
-            logger.error("No valid symbols extracted from WebSocket responses")
-            # 응답 샘플 로깅 (디버깅용)
-            if results:
-                logger.error("Sample response keys: %s", list(results[0].keys()))
-            raise RuntimeError("Failed to extract symbols from ticker data")
-            
-        return top 
+
+        top_symbols: list[str] = [d["market"] for d in results[: self.max_symbols]]
+
+        if not top_symbols:
+            raise RuntimeError("Failed to extract top symbols from ticker data")
+
+        return top_symbols 

@@ -146,4 +146,25 @@ class WebSocketClient:
     def run(symbol: str, market_queue: Queue, stop_event: threading.Event) -> None:
         """기존 호환성을 위한 static 메서드"""
         client = WebSocketClient(["ticker"], [symbol])
-        client.run_with_reconnect(market_queue, stop_event) 
+        client.run_with_reconnect(market_queue, stop_event)
+
+    # ------------------------------------------------------------------
+    # Dynamic subscription helpers
+    # ------------------------------------------------------------------
+
+    def update_symbols(self, symbols: list[str]) -> None:
+        """구독 심볼 리스트를 동적으로 교체한다.
+
+        현재 pyupbit.WebSocketManager 는 subscribe/unsubscribe API 를 직접 제공하지 않으므로
+        내부 연결을 재설정하는 방식으로 구현한다.
+        호출 시 self.symbols 를 갱신하고 다음 루프에서 재연결하도록 is_connected 를 False 로 설정한다.
+        """
+        if set(symbols) == set(self.symbols):
+            return  # 변경 없음
+
+        logger.info("WebSocketClient symbols 업데이트: %s → %s", self.symbols, symbols)
+        self.symbols = symbols
+        # 다음 루프에서 재연결되도록 플래그 변경
+        self.is_connected = False
+        # 즉시 disconnect 해서 빠르게 반영
+        self.disconnect() 

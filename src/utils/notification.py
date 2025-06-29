@@ -87,12 +87,15 @@ class TelegramBot:
             await update.message.reply_text(help_text)
 
         async def _run() -> None:
-            application = (
-                ApplicationBuilder()
-                .token(TELEGRAM_TOKEN)
-                .rate_limiter(AIORateLimiter())
-                .build()
-            )
+            # AIORateLimiter 는 설치 환경에 따라 누락될 수 있다. 예외 발생 시 레이트 리미터 없이 진행한다.
+            builder = ApplicationBuilder().token(TELEGRAM_TOKEN)
+
+            try:
+                builder = builder.rate_limiter(AIORateLimiter())
+            except RuntimeError as exc:
+                logger.warning("AIORateLimiter 비활성화: %s – 레이트 리미터 없이 실행합니다.", exc)
+
+            application = builder.build()
 
             # 명령 핸들러 등록
             application.add_handler(CommandHandler("pause", _pause))

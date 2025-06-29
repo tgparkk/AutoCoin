@@ -26,6 +26,80 @@ class Trader:
     PENDING_TIMEOUT_SEC = 10.0     # 미체결 시 자동 취소 시점(초)
 
     @staticmethod
+    def rebind_symbols(
+        new_symbols: list[str],
+        strategy_manager: StrategyManager,
+        risk_managers: Dict[str, RiskManager],
+        coin_balances: Dict[str, float],
+        last_prices: Dict[str, float],
+        order_q: Queue,
+        pending_requests: Dict[str, Any],
+        notify_q: Queue,
+    ) -> None:
+        """심볼 변경 시 포지션·리스크 매니저·잔고 구조를 재바인딩한다.
+
+        1. 제거된(sym not in new_symbols) 심볼 중 보유 수량이 있는 경우 시장가 전량 매도 주문
+           → 체결 이후 잔고 재조회 로직은 기존 pending_orders 처리부에서 수행된다.
+        2. risk_managers / balances / price dict를 업데이트해 신규 심볼을 추가하고 제거 심볼을 뺀다.
+        """
+
+        cur_syms = set(risk_managers.keys())
+        new_syms_set = set(new_symbols)
+
+        removed_syms = cur_syms - new_syms_set
+        added_syms = new_syms_set - cur_syms
+
+        # ---------------- 제거 심볼 처리 ----------------
+        for sym in removed_syms:
+            vol = coin_balances.get(sym, 0.0)
+            if vol and vol > 0:
+                sell_req_id = str(uuid.uuid4())
+                order_q.put({
+                    "type": "order",
+                    "params": {
+                        "market": sym,
+                        "side": "sell",
+                        "ord_type": "market",
+                        "volume": vol,
+                    },
+                    "request_id": sell_req_id,
+                })
+                pending_requests[sell_req_id] = {
+                    "type": "sell_order",
+                    "symbol": sym,
+                    "price": last_prices.get(sym, 0.0),
+                    "volume": vol,
+                    "reason": "symbol_removed",
+                }
+                notify_q.put(f"[AUTO SELL] {sym} 제거로 전량 매도 요청")
+
+            # regardless of position, remove from dictionaries to prevent further trading
+            risk_managers.pop(sym, None)
+            coin_balances.pop(sym, None)
+            last_prices.pop(sym, None)
+
+        # ---------------- 추가 심볼 처리 ----------------
+        for sym in added_syms:
+            risk_managers[sym] = RiskManager(get_max_position_krw(sym))
+            coin_balances[sym] = coin_balances.get(sym, 0.0)
+            last_prices[sym] = last_prices.get(sym, 0.0)
+
+            # 잔고 조회 (새 심볼 첫 추가)
+            bal_req_id = str(uuid.uuid4())
+            order_q.put({
+                "type": "query",
+                "method": "get_balance",
+                "params": {"ticker": sym},
+                "request_id": bal_req_id,
+            })
+            pending_requests[bal_req_id] = {"type": "balance_coin", "symbol": sym}
+
+        # StrategyManager 에 심볼 업데이트
+        strategy_manager.update_symbols(list(new_syms_set))
+
+        notify_q.put(f"[SYMBOLS] 업데이트 완료 → {sorted(new_syms_set)}")
+
+    @staticmethod
     def run(
         market_q: Queue,
         command_q: Queue,
@@ -375,30 +449,16 @@ class Trader:
 
             # ---------------- 심볼 동적 갱신 ----------------
             if symbol_manager.maybe_refresh():
-                new_syms = symbol_manager.symbols
-                strategy_manager.update_symbols(new_syms)
-                # RiskManager & 잔고 dict 업데이트
-                for sym in new_syms:
-                    if sym not in risk_managers:
-                        risk_managers[sym] = RiskManager(get_max_position_krw(sym))
-                    if sym not in coin_balances:
-                        coin_balances[sym] = 0.0
-                        last_prices[sym] = 0.0
-                        # 잔고 조회 요청
-                        coin_req_id = str(uuid.uuid4())
-                        order_q.put({
-                            "type": "query",
-                            "method": "get_balance",
-                            "params": {"ticker": sym},
-                            "request_id": coin_req_id
-                        })
-                        pending_requests[coin_req_id] = {"type": "balance_coin", "symbol": sym}
-                # 제거된 심볼 정리
-                for sym in list(risk_managers.keys()):
-                    if sym not in new_syms:
-                        risk_managers.pop(sym, None)
-                        coin_balances.pop(sym, None)
-                        last_prices.pop(sym, None)
+                Trader.rebind_symbols(
+                    symbol_manager.symbols,
+                    strategy_manager,
+                    risk_managers,
+                    coin_balances,
+                    last_prices,
+                    order_q,
+                    pending_requests,
+                    notify_q,
+                )
 
         logger.info("Trader 종료")
 

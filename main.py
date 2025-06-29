@@ -12,6 +12,7 @@ from src.utils.logger import get_logger
 from config.strategy_config import SYMBOLS
 from config.api_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 from src.utils.symbol_manager import SymbolManager
+from src.indicators.indicator_worker import indicator_worker_process
 
 logger = get_logger(__name__)
 
@@ -30,21 +31,25 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
     for symbol in SYMBOLS:
         tick_queues[symbol] = manager.Queue(maxsize=2000)
 
-    # 심볼 매니저 초기화 (메인 프로세스 전역)
-    symbol_manager = SymbolManager(SYMBOLS)
+    # IndicatorWorker 공유 객체 -----------------------------------------
+    buyable_symbols = manager.dict()  # {market: True}
 
-    # WebSocket 프로세스 단일 인스턴스 관리
+    # 심볼 매니저 초기화 (메인 프로세스 전역) – buyable_symbols 활용
+    symbol_manager = SymbolManager(SYMBOLS, buyable_symbols=buyable_symbols)
+
+    # 심볼 업데이트 브로드캐스트용 큐 & Event
+    symbols_event_q = manager.Queue()
+    symbols_updated_ev = manager.Event()
+
+    # WebSocket 프로세스 단일 인스턴스 관리 (재시작 대신 subscribe 업데이트 사용)
     ws_proc: mp.Process | None = None
 
     def _spawn_ws(symbols: list[str]):
         nonlocal ws_proc
-        # 기존 프로세스가 있으면 종료
+        # 기존 프로세스가 있으면 종료 (초기 1회만 실행됨)
         if ws_proc is not None and ws_proc.is_alive():
-            ws_proc.terminate()
-            ws_proc.join(timeout=3)
-            if ws_proc in procs:
-                procs.remove(ws_proc)
-        
+            return
+
         # 큐 준비
         for sym in symbols:
             if sym not in tick_queues:
@@ -52,7 +57,7 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
 
         ws_proc = mp.Process(
             target=websocket_process,
-            args=(symbols, tick_queues, shutdown_ev),
+            args=(symbols, tick_queues, shutdown_ev, symbols_event_q, symbols_updated_ev),
             daemon=False,  # pyupbit 내부에서 프로세스를 생성하므로 daemon=False 필요
             name="WebSocket"
         )
@@ -133,6 +138,15 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
     else:
         logger.info("Telegram 비활성화 상태로 시작합니다 (use_telegram=%s, token=%s, chat_id=%s)", use_telegram, bool(TELEGRAM_TOKEN), bool(TELEGRAM_CHAT_ID))
 
+    # ---------------- IndicatorWorker 프로세스 -------------------------
+    indicator_proc = mp.Process(
+        target=indicator_worker_process,
+        args=(unified_tick_q, buyable_symbols, shutdown_ev),
+        daemon=True,
+        name="IndicatorWorker",
+    )
+    procs.append(indicator_proc)
+
     # 프로세스 시작
     for p in procs:
         if not p.is_alive():  # 중복 시작 방지
@@ -156,7 +170,11 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
                         for s in rem_syms:
                             tick_queues.pop(s, None)
 
-                        _restart_ws(new_syms)
+                        _spawn_ws(new_syms)
+
+                        # WebSocket 프로세스에 심볼 업데이트 브로드캐스트
+                        symbols_event_q.put(list(new_syms))
+                        symbols_updated_ev.set()
 
             except Exception as exc:  # pragma: no cover
                 logger.warning("Symbol refresh error: %s", exc)
