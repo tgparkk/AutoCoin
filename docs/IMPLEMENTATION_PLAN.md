@@ -40,7 +40,7 @@
 | 구분 | 세부 내용 | 우선도 | 상태 |
 |------|----------|--------|------|
 | 6.1 | **Dockerfile & docker-compose** 작성 | ★★☆ | ✅ |
-| 6.2 | **GitHub Actions CI/CD** – 테스트 → 이미지 빌드 → Vultr 배포 | ★★☆ |
+| 6.2 | **GitHub Actions CI/CD** – 테스트 → 이미지 빌드 → Vultr 배포 | ★★☆ | ✅ |
 | 6.3 | **모니터링** – Prometheus Exporter → Grafana 대시보드 | ★★☆ |
 
 ## 7. 테스트 & 품질
