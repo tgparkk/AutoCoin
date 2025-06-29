@@ -1,7 +1,7 @@
-import multiprocessing as mp
-from multiprocessing import Manager
-import time
 import argparse
+import multiprocessing as mp
+import time
+from multiprocessing import Manager
 
 from src.processes.websocket_proc import websocket_process
 from src.processes.trader_proc import trader_process
@@ -19,8 +19,9 @@ logger = get_logger(__name__)
 def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
     """엔트리 포인트 – 멀티프로세스 초기화 및 실행"""
 
-    mp.freeze_support()
-    mp.set_start_method("fork", force=True)
+    # Docker 환경에서 안전한 멀티프로세싱을 위해 spawn 사용
+    if mp.get_start_method(allow_none=True) != 'spawn':
+        mp.set_start_method("spawn", force=True)
 
     manager: Manager = mp.Manager()
 
@@ -37,6 +38,13 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
 
     def _spawn_ws(symbols: list[str]):
         nonlocal ws_proc
+        # 기존 프로세스가 있으면 종료
+        if ws_proc is not None and ws_proc.is_alive():
+            ws_proc.terminate()
+            ws_proc.join(timeout=3)
+            if ws_proc in procs:
+                procs.remove(ws_proc)
+        
         # 큐 준비
         for sym in symbols:
             if sym not in tick_queues:
@@ -58,7 +66,8 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
             ws_proc.terminate()
             ws_proc.join(timeout=3)
             logger.info("웹소켓 프로세스 재시작")
-            procs.remove(ws_proc)
+            if ws_proc in procs:
+                procs.remove(ws_proc)
         _spawn_ws(symbols)
 
     command_q = manager.Queue()
@@ -89,48 +98,46 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
     procs.append(tick_merger_proc)
     
     # 나머지 프로세스들
-    procs.extend([
-        mp.Process(
-            target=trader_process, 
-            args=(unified_tick_q, command_q, notify_q, db_q, order_q, resp_q, shutdown_ev, strategy_name), 
-            daemon=True,
-            name="Trader"
-        ),
-        mp.Process(
-            target=api_process, 
-            args=(order_q, resp_q, notify_q, shutdown_ev), 
-            daemon=True,
-            name="API"
-        ),
-    ])
+    trader_proc = mp.Process(
+        target=trader_process, 
+        args=(unified_tick_q, command_q, notify_q, db_q, order_q, resp_q, shutdown_ev, strategy_name), 
+        daemon=True,
+        name="Trader"
+    )
+    
+    api_proc = mp.Process(
+        target=api_process, 
+        args=(order_q, resp_q, notify_q, shutdown_ev), 
+        daemon=True,
+        name="API"
+    )
+    
+    db_proc = mp.Process(
+        target=DBWriter.run, 
+        args=(db_q, shutdown_ev), 
+        daemon=True,
+        name="Database"
+    )
+    
+    procs.extend([trader_proc, api_proc, db_proc])
 
     # Telegram 프로세스는 옵션
-    optional_procs: list[mp.Process] = []
     if use_telegram and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        optional_procs.append(
-            mp.Process(
-                target=telegram_process,
-                args=(command_q, notify_q, shutdown_ev),
-                daemon=True,
-                name="Telegram",
-            )
+        telegram_proc = mp.Process(
+            target=telegram_process,
+            args=(command_q, notify_q, shutdown_ev),
+            daemon=True,
+            name="Telegram",
         )
+        procs.append(telegram_proc)
     else:
         logger.info("Telegram 비활성화 상태로 시작합니다 (use_telegram=%s, token=%s, chat_id=%s)", use_telegram, bool(TELEGRAM_TOKEN), bool(TELEGRAM_CHAT_ID))
 
-    procs.extend([
-        *optional_procs,
-        mp.Process(
-            target=DBWriter.run, 
-            args=(db_q, shutdown_ev), 
-            daemon=True,
-            name="Database"
-        ),
-    ])
-
+    # 프로세스 시작
     for p in procs:
-        p.start()
-        logger.info("프로세스 시작: %s (pid=%s)", p.name, p.pid)
+        if not p.is_alive():  # 중복 시작 방지
+            p.start()
+            logger.info("프로세스 시작: %s (pid=%s)", p.name, p.pid)
 
     try:
         while any(p.is_alive() for p in procs):
@@ -159,9 +166,12 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
         logger.info("KeyboardInterrupt 감지 – 종료 신호 발송")
         shutdown_ev.set()
     finally:
+        # 모든 프로세스 종료 대기
         for p in procs:
-            p.join(timeout=5)
-            logger.info("프로세스 종료: %s", p.name)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+                logger.info("프로세스 종료: %s", p.name)
 
 
 def _tick_merger_process(tick_queues: dict, unified_queue, shutdown_ev) -> None:
