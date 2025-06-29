@@ -4,6 +4,7 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from enum import Enum
 import time
+from config.risk_config import FEE_RATE, DEFAULT_SLIPPAGE_PCT
 
 
 class PositionType(Enum):
@@ -123,12 +124,25 @@ class BaseStrategy(ABC):
     def _on_sell_fill(self, fill: OrderFill) -> None:
         """매도 체결 처리"""
         if self.position.position_type == PositionType.LONG:
-            # 실현 손익 계산
-            pnl = (fill.price - self.position.entry_price) * self.position.volume
-            self.position.realized_pnl += pnl
-            self.total_pnl += pnl
+            # ---------------- 실현 손익 계산 ----------------
+            executed_volume = min(fill.volume, self.position.volume) or self.position.volume
+
+            # 1) 기본 차익
+            gross_pnl = (fill.price - self.position.entry_price) * executed_volume
+
+            # 2) 수수료 (진입·청산 각각 부과)
+            fee_in = self.position.entry_price * executed_volume * FEE_RATE
+            fee_out = fill.price * executed_volume * FEE_RATE
+
+            # 3) 슬리피지 비용 (진입 시점 기준)
+            slippage_cost = self.position.entry_price * executed_volume * (DEFAULT_SLIPPAGE_PCT / 100)
+
+            net_pnl = gross_pnl - fee_in - fee_out - slippage_cost
+
+            self.position.realized_pnl += net_pnl
+            self.total_pnl += net_pnl
             
-            if pnl > 0:
+            if net_pnl > 0:
                 self.winning_trades += 1
         
         # 포지션 초기화
@@ -151,7 +165,11 @@ class BaseStrategy(ABC):
     def _update_unrealized_pnl(self, current_price: float) -> None:
         """미실현 손익 업데이트"""
         if self.position.position_type == PositionType.LONG:
-            self.position.unrealized_pnl = (current_price - self.position.entry_price) * self.position.volume
+            executed_volume = self.position.volume
+            gross_pnl = (current_price - self.position.entry_price) * executed_volume
+            fee_estimate = (current_price + self.position.entry_price) * executed_volume * FEE_RATE
+            slippage_cost = self.position.entry_price * executed_volume * (DEFAULT_SLIPPAGE_PCT / 100)
+            self.position.unrealized_pnl = gross_pnl - fee_estimate - slippage_cost
     
     def get_position_info(self) -> Dict[str, Any]:
         """현재 포지션 정보 반환"""

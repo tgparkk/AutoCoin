@@ -20,6 +20,11 @@ class ScalpingStrategy(BaseStrategy):
         # 상태 변수
         self.prices: deque[float] = deque(maxlen=self.window)
 
+        # 호가 기반 필터링
+        self.max_spread = config.get("max_allowed_spread", 1000) if config else 1000  # KRW 단위 허용 스프레드
+        self.best_bid: float | None = None
+        self.best_ask: float | None = None
+
     def _prepare_indicators(self, historical_data: Optional[List[Dict]] = None) -> None:
         """지표 초기화"""
         self.prices.clear()
@@ -108,6 +113,31 @@ class ScalpingStrategy(BaseStrategy):
             "window": self.window,
             "take_profit_pct": self.take_profit_pct,
             "stop_loss_pct": self.stop_loss_pct,
+            "max_spread": self.max_spread,
             "price_buffer_size": len(self.prices),
             "last_hold_time": self.state.get("last_hold_time", 0)
-        } 
+        }
+
+    # ------------------------------------------------------------------
+    # 주문book/스프레드 필터링용 on_tick 오버라이드
+    # ------------------------------------------------------------------
+
+    def on_tick(self, tick: Dict[str, Any]) -> Dict[str, Any]:
+        """호가(orderbook) 메시지를 우선 처리한 뒤 기본 로직 호출"""
+
+        # 1) ORDERBOOK 메시지: 호가 정보만 저장
+        if tick.get("type") == "orderbook":
+            self.best_bid = tick.get("best_bid")
+            self.best_ask = tick.get("best_ask")
+            return {"action": "none"}
+
+        # 2) 스프레드가 과도하면 거래 skip
+        if self.best_bid is None or self.best_ask is None:
+            return {"action": "none"}
+
+        spread = self.best_ask - self.best_bid
+        if spread > self.max_spread:
+            return {"action": "none"}
+
+        # 3) 정상적인 ticker → 기존 로직 진행
+        return super().on_tick(tick) 

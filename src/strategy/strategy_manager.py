@@ -214,4 +214,51 @@ class StrategyManager:
                 symbol: get_strategy_config(symbol) 
                 for symbol in self.strategies.keys()
             }
-        } 
+        }
+    
+    def update_symbols(self, new_symbols: list[str]) -> None:
+        """활성 종목 리스트를 업데이트한다.
+
+        Args:
+            new_symbols: 새 심볼 리스트
+        """
+        current_set = set(self.strategies.keys())
+        new_set = set(new_symbols)
+
+        added = new_set - current_set
+        removed = current_set - new_set
+
+        if not added and not removed:
+            return  # 변경 없음
+
+        # --- 추가 심볼 --- #
+        strategy_class = self.AVAILABLE_STRATEGIES[self.strategy_name]
+        for sym in added:
+            try:
+                config = get_strategy_config(sym)
+                self.strategies[sym] = strategy_class(sym, config)
+                self.strategies[sym].prepare()
+                logger.info("전략 추가: %s", sym)
+            except Exception as exc:  # pragma: no cover – continues others
+                logger.warning("전략 추가 실패 %s: %s", sym, exc)
+
+        # --- 제거 심볼 --- #
+        for sym in removed:
+            strat = self.strategies.pop(sym, None)
+            if strat is None:
+                continue
+            # 포지션이 열려있으면 경고 후 유지하도록 결정(보수적)
+            pos = strat.get_position_info()
+            if pos["position_type"] != "none":
+                logger.warning("제거 대상 %s 에 열린 포지션이 존재 – 유지합니다", sym)
+                self.strategies[sym] = strat  # 다시 복구
+                continue
+            logger.info("전략 제거: %s", sym)
+
+        # 포트폴리오 상태 리셋(합산 값 재계산)
+        self.total_position_value = sum(
+            s.position.entry_price * s.position.volume for s in self.strategies.values() if s.position
+        )
+        self.active_positions = sum(
+            1 for s in self.strategies.values() if s.position and s.position.position_type != PositionType.NONE
+        ) 

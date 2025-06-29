@@ -11,6 +11,7 @@ from src.strategy.base_strategy import OrderFill
 from src.trading.risk_manager import RiskManager
 from config.strategy_config import SYMBOLS, get_max_position_krw
 from src.utils.logger import get_logger
+from src.utils.symbol_manager import SymbolManager
 
 logger = get_logger(__name__)
 
@@ -19,6 +20,10 @@ class Trader:
     """실시간 데이터로 다중 종목 전략 실행 및 주문"""
 
     ORDER_INTERVAL = 0.15  # 초 (Upbit 1초당 8회 제한)
+
+    # ---------------- Pending-order 관리 상수 ----------------
+    PENDING_CHECK_INTERVAL = 0.3  # 주문 상태 조회 주기(초)
+    PENDING_TIMEOUT_SEC = 10.0     # 미체결 시 자동 취소 시점(초)
 
     @staticmethod
     def run(
@@ -38,21 +43,25 @@ class Trader:
             logger.error("전략 초기화 실패")
             return
         
+        # ---------------- 심볼 매니저 ----------------
+        symbol_manager = SymbolManager(SYMBOLS)
+
         # 리스크 매니저 (종목별로 관리)
         risk_managers = {
             symbol: RiskManager(get_max_position_krw(symbol)) 
-            for symbol in SYMBOLS
+            for symbol in symbol_manager.symbols
         }
 
         last_order_ts = 0.0
         trading_paused = False  # /pause 명령 처리용
         pending_requests = {}  # {request_id: request_info}
+        pending_orders = {}    # {uuid: order_info}
         
         # 종목별 잔고 관리
         krw_balance = 0.0  # 현금 잔고
-        coin_balances = {symbol: 0.0 for symbol in SYMBOLS}  # 보유 코인 수량
+        coin_balances = {symbol: 0.0 for symbol in symbol_manager.symbols}  # 보유 코인 수량
         # 코인별 최근 가격 저장 (자산 비중 계산용)
-        last_prices = {symbol: 0.0 for symbol in SYMBOLS}
+        last_prices = {symbol: 0.0 for symbol in symbol_manager.symbols}
         
         # 초기 잔고 조회
         balance_req_id = str(uuid.uuid4())
@@ -65,7 +74,7 @@ class Trader:
         pending_requests[balance_req_id] = {"type": "balance_krw"}
         
         # 각 종목별 코인 잔고 조회
-        for symbol in SYMBOLS:
+        for symbol in symbol_manager.symbols:
             coin_req_id = str(uuid.uuid4())
             order_q.put({
                 "type": "query",
@@ -75,7 +84,7 @@ class Trader:
             })
             pending_requests[coin_req_id] = {"type": "balance_coin", "symbol": symbol}
 
-        logger.info("Trader 시작: 전략=%s, 종목=%s", strategy_name, SYMBOLS)
+        logger.info("Trader 시작: 전략=%s, 종목=%s", strategy_name, symbol_manager.symbols)
 
         while not stop_event.is_set():
             # 명령 큐 처리
@@ -124,47 +133,94 @@ class Trader:
                         elif req_info["type"] == "buy_order":
                             symbol = req_info["symbol"]
                             if "uuid" in response:
-                                # 주문 체결 정보를 전략에 전달
-                                fill = OrderFill(
-                                    symbol=symbol,
-                                    side="buy",
-                                    price=req_info["price"],
-                                    volume=req_info["volume"],
-                                    timestamp=time.time(),
-                                    order_id=response["uuid"]
-                                )
-                                strategy_manager.process_order_fill(symbol, fill)
-                                
-                                notify_q.put(f"[BUY] {symbol} @ {req_info['price']} (ID: {response['uuid'][:8]})")
-                                db_q.put((datetime.utcnow().isoformat(), "BUY", symbol, req_info["price"], req_info["volume"]))
-                                
-                                # 잔고 재조회
-                                _refresh_balances(order_q, pending_requests, symbol)
+                                # 주문 접수(미체결) 상태로 등록
+                                uuid_val = response["uuid"]
+                                pending_orders[uuid_val] = {
+                                    "symbol": symbol,
+                                    "side": "buy",
+                                    "volume": req_info["volume"],
+                                    "price": req_info["price"],
+                                    "sent_ts": time.time(),
+                                    "last_check": 0.0,
+                                }
+                                notify_q.put(f"[BUY REQUEST] {symbol} 접수 (ID: {uuid_val[:8]})")
                             else:
                                 notify_q.put(f"[BUY ERROR] {symbol}: {response}")
                                 
                         elif req_info["type"] == "sell_order":
                             symbol = req_info["symbol"]
                             if "uuid" in response:
-                                # 주문 체결 정보를 전략에 전달
-                                fill = OrderFill(
-                                    symbol=symbol,
-                                    side="sell",
-                                    price=req_info["price"],
-                                    volume=req_info["volume"],
-                                    timestamp=time.time(),
-                                    order_id=response["uuid"]
-                                )
-                                strategy_manager.process_order_fill(symbol, fill)
-                                
-                                notify_q.put(f"[SELL] {symbol} @ {req_info['price']} (ID: {response['uuid'][:8]})")
-                                db_q.put((datetime.utcnow().isoformat(), "SELL", symbol, req_info["price"], req_info["volume"]))
-                                
-                                # 잔고 재조회
-                                _refresh_balances(order_q, pending_requests, symbol)
+                                uuid_val = response["uuid"]
+                                pending_orders[uuid_val] = {
+                                    "symbol": symbol,
+                                    "side": "sell",
+                                    "volume": req_info["volume"],
+                                    "price": req_info["price"],
+                                    "sent_ts": time.time(),
+                                    "last_check": 0.0,
+                                }
+                                notify_q.put(f"[SELL REQUEST] {symbol} 접수 (ID: {uuid_val[:8]})")
                             else:
                                 notify_q.put(f"[SELL ERROR] {symbol}: {response}")
-                                
+
+                        # ---------------- 주문 상태 응답 ----------------
+                        elif req_info["type"] == "order_status":
+                            uuid_val = req_info["uuid"]
+                            po = pending_orders.get(uuid_val)
+                            if po is None:
+                                continue  # 이미 처리되었을 가능성
+
+                            data = response.get("result", {})
+                            state = data.get("state")
+
+                            # 체결 완료
+                            if state == "done":
+                                try:
+                                    total_vol = float(data.get("volume", 0))
+                                    remain_vol = float(data.get("remaining_volume", 0))
+                                    exec_vol = total_vol - remain_vol if total_vol else po["volume"]
+                                except Exception:
+                                    exec_vol = po["volume"]
+
+                                # 평균 체결가 계산
+                                try:
+                                    trades = data.get("trades", [])
+                                    if trades:
+                                        avg_price = sum(float(t["price"]) * float(t["volume"]) for t in trades) / sum(float(t["volume"]) for t in trades)
+                                    else:
+                                        avg_price = po["price"]
+                                except Exception:
+                                    avg_price = po["price"]
+
+                                fill = OrderFill(
+                                    symbol=po["symbol"],
+                                    side=po["side"],
+                                    price=avg_price,
+                                    volume=exec_vol,
+                                    timestamp=time.time(),
+                                    order_id=uuid_val,
+                                )
+                                strategy_manager.process_order_fill(po["symbol"], fill)
+
+                                notify_q.put(f"[FILL] {po['side'].upper()} {po['symbol']} @ {avg_price:.0f} (ID: {uuid_val[:8]})")
+                                db_q.put((datetime.utcnow().isoformat(), po["side"].upper(), po["symbol"], avg_price, exec_vol))
+
+                                # 잔고 재조회
+                                _refresh_balances(order_q, pending_requests, po["symbol"])
+
+                                pending_orders.pop(uuid_val, None)
+
+                            # 미체결(cancel 포함)
+                            elif state in ("cancel", "fail"):
+                                notify_q.put(f"[CANCEL] {po['symbol']} 주문 취소/실패 (ID: {uuid_val[:8]})")
+                                pending_orders.pop(uuid_val, None)
+
+                        # ---------------- 주문 취소 응답 ----------------
+                        elif req_info["type"] == "cancel_order":
+                            uuid_val = req_info["uuid"]
+                            pending_orders.pop(uuid_val, None)
+                            notify_q.put(f"[CANCELLED] 주문취소 완료 (ID: {uuid_val[:8]})")
+
                 except Exception as exc:
                     logger.exception("응답 처리 오류: %s", exc)
 
@@ -173,23 +229,50 @@ class Trader:
                 time.sleep(0.1)
                 continue
 
+            # -------------------- Pending 주문 상태 조회 --------------------
+            now_ts = time.time()
+            for uid, po in list(pending_orders.items()):
+                # 상태 조회 주기
+                if now_ts - po["last_check"] >= Trader.PENDING_CHECK_INTERVAL:
+                    status_req_id = str(uuid.uuid4())
+                    order_q.put({
+                        "type": "query",
+                        "method": "get_order",
+                        "params": {"uuid": uid},
+                        "request_id": status_req_id,
+                    })
+                    pending_requests[status_req_id] = {"type": "order_status", "uuid": uid}
+                    po["last_check"] = now_ts
+
+                # 타임아웃 처리(선택)
+                if now_ts - po["sent_ts"] >= Trader.PENDING_TIMEOUT_SEC:
+                    cancel_req_id = str(uuid.uuid4())
+                    order_q.put({
+                        "type": "query",
+                        "method": "cancel_order",
+                        "params": {"uuid": uid},
+                        "request_id": cancel_req_id,
+                    })
+                    pending_requests[cancel_req_id] = {"type": "cancel_order", "uuid": uid}
+
             # 시장 데이터 처리
             try:
                 tick = market_q.get(timeout=1)
                 symbol = tick.get("code") or tick.get("market")
                 
-                if not symbol or symbol not in SYMBOLS:
+                if not symbol or symbol not in symbol_manager.symbols:
                     continue
                     
             except Empty:
                 continue
 
             try:
-                current_price = tick["trade_price"]
+                current_price = tick.get("trade_price")
                 # 최근 가격 저장 (자산 비중 계산용)
-                last_prices[symbol] = current_price
+                if current_price is not None:
+                    last_prices[symbol] = current_price
                 
-                # 전략 실행
+                # 전략 실행 (ticker & orderbook 모두 전달)
                 signal = strategy_manager.process_tick(symbol, tick)
                 if not signal or signal.get("action") == "none":
                     continue
@@ -203,13 +286,15 @@ class Trader:
                 
                 # 매수 처리
                 if action == "buy":
+                    if current_price is None:
+                        continue  # 가격 정보 없으면 주문 불가
                     risk_mgr = risk_managers[symbol]
 
                     # -------------------- Risk / Money Management --------------------
                     # 1) 자산 비중 계산
                     total_coin_value = sum(
                         coin_balances[sym] * last_prices.get(sym, 0.0)
-                        for sym in SYMBOLS
+                        for sym in symbol_manager.symbols
                     )
                     total_assets = total_coin_value + krw_balance
                     coin_ratio = (total_coin_value / total_assets) if total_assets > 0 else 0.0
@@ -254,6 +339,8 @@ class Trader:
 
                 # 매도 처리
                 elif action == "sell":
+                    if current_price is None:
+                        continue  # 가격 정보 없으면 주문 불가
                     coin_balance = coin_balances.get(symbol, 0.0)
                     sell_volume = signal.get("volume", coin_balance)  # 부분 청산 지원
                     
@@ -285,7 +372,34 @@ class Trader:
 
             # CPU cool-down
             time.sleep(0.01)
-        
+
+            # ---------------- 심볼 동적 갱신 ----------------
+            if symbol_manager.maybe_refresh():
+                new_syms = symbol_manager.symbols
+                strategy_manager.update_symbols(new_syms)
+                # RiskManager & 잔고 dict 업데이트
+                for sym in new_syms:
+                    if sym not in risk_managers:
+                        risk_managers[sym] = RiskManager(get_max_position_krw(sym))
+                    if sym not in coin_balances:
+                        coin_balances[sym] = 0.0
+                        last_prices[sym] = 0.0
+                        # 잔고 조회 요청
+                        coin_req_id = str(uuid.uuid4())
+                        order_q.put({
+                            "type": "query",
+                            "method": "get_balance",
+                            "params": {"ticker": sym},
+                            "request_id": coin_req_id
+                        })
+                        pending_requests[coin_req_id] = {"type": "balance_coin", "symbol": sym}
+                # 제거된 심볼 정리
+                for sym in list(risk_managers.keys()):
+                    if sym not in new_syms:
+                        risk_managers.pop(sym, None)
+                        coin_balances.pop(sym, None)
+                        last_prices.pop(sym, None)
+
         logger.info("Trader 종료")
 
 

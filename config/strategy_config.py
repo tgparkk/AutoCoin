@@ -9,6 +9,7 @@ DEFAULT_STRATEGY_CONFIG = {
     "take_profit_pct": 0.5,  # 이익 실현 퍼센트
     "stop_loss_pct": 1.0,    # 손절 퍼센트
     "window": 5,             # 가격 윈도우 크기
+    "max_allowed_spread": 1000,  # 호가 스프레드 허용 한도(KRW)
 }
 
 # 종목별 개별 설정 (기본값 오버라이드)

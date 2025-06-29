@@ -11,6 +11,7 @@ from src.database.database import DBWriter
 from src.utils.logger import get_logger
 from config.strategy_config import SYMBOLS
 from config.api_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+from src.utils.symbol_manager import SymbolManager
 
 logger = get_logger(__name__)
 
@@ -23,8 +24,43 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
 
     manager: Manager = mp.Manager()
 
-    # 종목별 틱 큐 생성
-    tick_queues = {symbol: manager.Queue(maxsize=2000) for symbol in SYMBOLS}
+    # tick_queues 를 Manager.dict 로 만들어 동적 추가·삭제 가능하게
+    tick_queues: dict = manager.dict()
+    for symbol in SYMBOLS:
+        tick_queues[symbol] = manager.Queue(maxsize=2000)
+
+    # 심볼 매니저 초기화 (메인 프로세스 전역)
+    symbol_manager = SymbolManager(SYMBOLS)
+
+    # WebSocket 프로세스 단일 인스턴스 관리
+    ws_proc: mp.Process | None = None
+
+    def _spawn_ws(symbols: list[str]):
+        nonlocal ws_proc
+        # 큐 준비
+        for sym in symbols:
+            if sym not in tick_queues:
+                tick_queues[sym] = manager.Queue(maxsize=2000)
+
+        ws_proc = mp.Process(
+            target=websocket_process,
+            args=(symbols, tick_queues, shutdown_ev),
+            daemon=True,
+            name="WebSocket"
+        )
+        ws_proc.start()
+        procs.append(ws_proc)
+        logger.info("웹소켓 프로세스 시작: %s (pid=%s)", symbols, ws_proc.pid)
+
+    def _restart_ws(symbols: list[str]):
+        nonlocal ws_proc
+        if ws_proc and ws_proc.is_alive():
+            ws_proc.terminate()
+            ws_proc.join(timeout=3)
+            logger.info("웹소켓 프로세스 재시작")
+            procs.remove(ws_proc)
+        _spawn_ws(symbols)
+
     command_q = manager.Queue()
     notify_q = manager.Queue()
     db_q = manager.Queue()
@@ -37,15 +73,8 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
 
     procs: list[mp.Process] = []
     
-    # 종목별 웹소켓 프로세스 생성
-    for symbol in SYMBOLS:
-        proc = mp.Process(
-            target=websocket_process, 
-            args=(symbol, tick_queues[symbol], shutdown_ev), 
-            daemon=True,
-            name=f"WebSocket-{symbol}"
-        )
-        procs.append(proc)
+    # 초기 웹소켓 프로세스 생성
+    _spawn_ws(symbol_manager.symbols)
     
     # 통합 틱 큐 (모든 종목의 데이터를 하나로 합침)
     unified_tick_q = manager.Queue(maxsize=5000)
@@ -105,6 +134,26 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
 
     try:
         while any(p.is_alive() for p in procs):
+            # 심볼 동적 갱신 체크 (30초 간격)
+            try:
+                if symbol_manager.maybe_refresh():
+                    new_syms = symbol_manager.symbols
+                    current_syms = set(tick_queues.keys())
+                    add_syms = set(new_syms) - current_syms
+                    rem_syms = current_syms - set(new_syms)
+
+                    if add_syms or rem_syms:
+                        # 큐 생성/제거
+                        for s in add_syms:
+                            tick_queues[s] = manager.Queue(maxsize=2000)
+                        for s in rem_syms:
+                            tick_queues.pop(s, None)
+
+                        _restart_ws(new_syms)
+
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Symbol refresh error: %s", exc)
+
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt 감지 – 종료 신호 발송")
