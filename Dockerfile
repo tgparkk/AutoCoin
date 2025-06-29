@@ -8,15 +8,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # 작업 디렉터리
 WORKDIR /app
 
-# 시스템 의존성 (필요 최소한)
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# Python 버전 확인 및 시스템 의존성 설치
+RUN python --version && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
 # 파이썬 의존성 복사 및 설치
 COPY requirements.txt ./
-RUN pip install --upgrade pip \
-    && pip install -r requirements.txt
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt && \
+    python -c "import sys; print(f'Python: {sys.version}'); import telegram; print(f'python-telegram-bot: {telegram.__version__}'); import aiolimiter; print('aiolimiter: OK')"
 
 # 프로젝트 소스 복사
 COPY . .
