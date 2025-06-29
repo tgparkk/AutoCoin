@@ -53,7 +53,7 @@ def main(strategy_name: str = "scalping", use_telegram: bool = True) -> None:
         ws_proc = mp.Process(
             target=websocket_process,
             args=(symbols, tick_queues, shutdown_ev),
-            daemon=True,
+            daemon=False,  # pyupbit 내부에서 프로세스를 생성하므로 daemon=False 필요
             name="WebSocket"
         )
         ws_proc.start()

@@ -10,7 +10,7 @@ from typing import List
 import time
 from threading import Lock
 
-import pyupbit  # Upbit REST wrapper – requirements.txt 에 이미 포함돼 있음
+import requests  # Upbit REST API 호출용
 
 from src.utils.logger import get_logger
 
@@ -63,14 +63,57 @@ class SymbolManager:  # pylint: disable=too-few-public-methods
 
     # ----------------------- Internal ----------------------- #
     def _select_symbols(self) -> List[str]:
-        """Upbit 시세 API를 호출해 24h 거래금액 상위 max_symbols 개를 반환한다."""
-        tickers = pyupbit.get_tickers(fiat="KRW")
-        if not tickers:
-            raise RuntimeError("No KRW tickers returned from Upbit API")
+        """Upbit WebSocket 스냅샷을 이용해 24h 거래대금 상위 심볼을 산출한다."""
+        import json
+        from websocket import create_connection  # websocket-client
 
-        market_data = pyupbit.get_ticker(tickers)
-        # `market_data` 는 list[dict] with keys: market, acc_trade_price_24h 등
-        # 정렬하여 상위 N개 선택
-        market_data.sort(key=lambda d: d.get("acc_trade_price_24h", 0.0), reverse=True)
-        top = [d["market"] for d in market_data[: self.max_symbols]]
+        # Upbit 종목 코드 조회는 공식 REST 엔드포인트만 지원된다.
+        url = "https://api.upbit.com/v1/market/all"
+        try:
+            resp = requests.get(url, timeout=5)
+            resp.raise_for_status()
+            markets = resp.json()
+            tickers = [m["market"] for m in markets if m["market"].startswith("KRW-")]
+        except Exception as exc:
+            raise RuntimeError(f"Failed to fetch KRW tickers: {exc}") from exc
+
+        if not tickers:
+            raise RuntimeError("No KRW tickers returned from Upbit REST API")
+
+        results: list[dict] = []
+        chunk_size = 100  # 웹소켓 codes 필드도 100개 이내가 안전
+
+        for i in range(0, len(tickers), chunk_size):
+            codes = tickers[i : i + chunk_size]
+            try:
+                ws = create_connection("wss://api.upbit.com/websocket/v1", timeout=5)
+                req_msg = [
+                    {"ticket": "symbol_manager"},
+                    {"type": "ticker", "codes": codes, "is_only_snapshot": True},
+                    {"format": "DEFAULT"},
+                ]
+                ws.send(json.dumps(req_msg))
+
+                for _ in codes:
+                    raw = ws.recv()
+                    # 응답은 bytes 형식
+                    if isinstance(raw, bytes):
+                        data = json.loads(raw.decode("utf-8"))
+                    else:
+                        data = json.loads(raw)
+                    results.append(data)
+            except Exception as exc:
+                logger.warning("WebSocket snapshot error (%s-%s): %s", i, i+chunk_size, exc)
+            finally:
+                try:
+                    ws.close()
+                except Exception:  # pragma: no cover
+                    pass
+
+        if not results:
+            raise RuntimeError("Failed to retrieve ticker snapshot via WebSocket")
+
+        # 정렬 후 상위 심볼 추출
+        results.sort(key=lambda d: d.get("acc_trade_price_24h", 0.0), reverse=True)
+        top = [d["cd"] for d in results[: self.max_symbols]]
         return top 
