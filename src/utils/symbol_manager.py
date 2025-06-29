@@ -115,5 +115,25 @@ class SymbolManager:  # pylint: disable=too-few-public-methods
 
         # 정렬 후 상위 심볼 추출
         results.sort(key=lambda d: d.get("acc_trade_price_24h", 0.0), reverse=True)
-        top = [d["cd"] for d in results[: self.max_symbols]]
+        
+        # WebSocket 응답 구조 디버깅 및 안전한 파싱
+        top = []
+        for i, d in enumerate(results[: self.max_symbols]):
+            if "cd" in d:
+                top.append(d["cd"])
+            elif "code" in d:
+                top.append(d["code"])
+            else:
+                logger.warning("Unexpected ticker response format at index %d: %s", i, list(d.keys())[:5])
+                # 기본값으로 market 필드 시도
+                if "market" in d:
+                    top.append(d["market"])
+        
+        if not top:
+            logger.error("No valid symbols extracted from WebSocket responses")
+            # 응답 샘플 로깅 (디버깅용)
+            if results:
+                logger.error("Sample response keys: %s", list(results[0].keys()))
+            raise RuntimeError("Failed to extract symbols from ticker data")
+            
         return top 
