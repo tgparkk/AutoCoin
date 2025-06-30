@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
 # 환경 변수 설정 – 캐시 파일 생성 방지 및 로그 버퍼링 비활성화
 ENV PYTHONDONTWRITEBYTECODE=1 \
