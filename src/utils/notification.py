@@ -142,7 +142,9 @@ class TelegramBot:
                 if application.updater:
                     # Telegram Polling 시작
                     await application.updater.start_polling()
-                    await application.updater.idle()  # stop() 호출 때까지 대기
+                    # idle() 대신 stop_event 를 주기적으로 확인하며 대기
+                    while not stop_event.is_set():
+                        await asyncio.sleep(0.5)
                 else:
                     # Updater 가 없으면 stop_event 대기
                     while not stop_event.is_set():
