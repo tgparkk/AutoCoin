@@ -113,7 +113,14 @@ class TelegramBot:
             application.add_handler(CommandHandler("help", _help))
 
             # JobQueue – 알림 전송
-            application.job_queue.run_repeating(_notification_job, interval=TelegramBot.POLL_INTERVAL)
+            if application.job_queue:
+                application.job_queue.run_repeating(
+                    _notification_job, interval=TelegramBot.POLL_INTERVAL
+                )
+            else:
+                logger.warning(
+                    "JobQueue 미사용 – python-telegram-bot[job-queue] 미설치"
+                )
 
             # stop_event 가 set 되면 애플리케이션도 중단시키는 코루틴
             async def _monitor_stop():
