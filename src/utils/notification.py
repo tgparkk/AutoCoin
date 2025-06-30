@@ -122,17 +122,33 @@ class TelegramBot:
                     "JobQueue 미사용 – python-telegram-bot[job-queue] 미설치"
                 )
 
-            # stop_event 가 set 되면 애플리케이션도 중단시키는 코루틴
+            # stop_event 가 set 될 때까지 대기한 후, 애플리케이션을 정지시킨다.
             async def _monitor_stop():
                 while not stop_event.is_set():
                     await asyncio.sleep(0.5)
-                await application.stop()
-                await application.shutdown()
+                if application.running:
+                    await application.stop()
 
-            application.create_task(_monitor_stop())
-
+            # Application 이 실제로 실행(drive)된 후에 백그라운드 태스크를 등록해야 PTB 경고가 발생하지 않는다.
             logger.info("TelegramBot 시작 – 챗 ID=%s", TELEGRAM_CHAT_ID)
-            await application.run_polling()
+
+            # ------------------ PTB life-cycle 수동 제어 ------------------
+            async with application:
+                await application.start()
+
+                # stop_event 를 감시하는 태스크는 *start 이후*에 등록한다.
+                application.create_task(_monitor_stop())
+
+                if application.updater:
+                    # Telegram Polling 시작
+                    await application.updater.start_polling()
+                    await application.updater.idle()  # stop() 호출 때까지 대기
+                else:
+                    # Updater 가 없으면 stop_event 대기
+                    while not stop_event.is_set():
+                        await asyncio.sleep(0.5)
+
+            # async with 블록을 벗어나면 initialize/stop/shutdown 이 자동으로 처리된다.
 
         # ------------------------------- run -------------------------------
         try:
