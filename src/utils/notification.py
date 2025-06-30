@@ -100,6 +100,7 @@ class TelegramBot:
                     "AIORateLimiter 비활성화: %s – 레이트 리미터 없이 실행합니다.",
                     exc,
                 )
+                builder = builder.rate_limiter(None)  # 자동 생성 방지
 
             application = builder.build()
 
